@@ -3,19 +3,15 @@ package com.example.vinscanner
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Rect
 import android.os.Bundle
 import android.util.Log
 import android.view.animation.AnimationUtils
 import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ExperimentalGetImage
-import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.ImageProxy
-import androidx.camera.core.Preview
+import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
-import com.example.vinscanner.ScannerActivity.Companion
 import com.example.vinscanner.databinding.ActivityOldScannerBinding
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
@@ -28,8 +24,21 @@ import java.util.concurrent.Executors
 class OldScannerActivity : AppCompatActivity() {
     private lateinit var binding: ActivityOldScannerBinding
     private lateinit var cameraExecutor: ExecutorService
-    private val decodedVinList = ArrayList<String>(MAX_SCAN_COUNT)
+    private val decodedVinList = ArrayList<VinScanResult>(MAX_SCAN_COUNT)
     private var isScanning = true
+    private var lastProcessedTimestamp = 0L
+
+    data class VinScanResult(
+        val value: String,
+        val confidence: Float,
+        val source: ScanSource,
+        val timestamp: Long
+    )
+
+    enum class ScanSource {
+        BARCODE,
+        OCR
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -47,7 +56,6 @@ class OldScannerActivity : AppCompatActivity() {
     }
 
     private fun setupUI() {
-        // Start scanner line animation
         val scanAnimation = AnimationUtils.loadAnimation(this, R.anim.scanner_line_animation)
         binding.scannerLine.startAnimation(scanAnimation)
     }
@@ -61,18 +69,18 @@ class OldScannerActivity : AppCompatActivity() {
     }
 
     private fun bindPreview(cameraProvider: ProcessCameraProvider) {
-        val preview = Preview.Builder().build().apply {
-            setSurfaceProvider(binding.previewView.surfaceProvider)
-        }
+        val preview = Preview.Builder()
+            .build()
+            .apply {
+                setSurfaceProvider(binding.previewView.surfaceProvider)
+            }
 
         val imageAnalysis = ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
             .build()
             .also {
-                it.setAnalyzer(cameraExecutor, BarcodeAndTextAnalyzer(
-                    { barcode -> processBarcode(barcode) },
-                    { text -> processOCRText(text) }
+                it.setAnalyzer(cameraExecutor, EnhancedBarcodeAndTextAnalyzer(
+                    onVinDetected = { result -> processVinResult(result) }
                 ))
             }
 
@@ -89,52 +97,37 @@ class OldScannerActivity : AppCompatActivity() {
         }
     }
 
-    private fun processOCRText(text: String) {
-        if (!isScanning || decodedVinList.size >= MAX_SCAN_COUNT) return
+    private fun setupAutoFocus(camera: Camera) {
+        val factory = SurfaceOrientedMeteringPointFactory(
+            binding.previewView.width.toFloat(),
+            binding.previewView.height.toFloat()
+        )
+        val centerPoint = factory.createPoint(0.5f, 0.5f)
 
-        val potentialVINs = extractPotentialVINs(text)
-        potentialVINs.forEach { vin ->
-            if (isValidVin(vin)) {
-                Log.d(TAG, "OCR Reading -> $vin")
-                decodedVinList.add(vin)
-                checkMaxVinArraySize()
-            }
-        }
-    }
-    private fun extractPotentialVINs(text: String): List<String> {
-        val vinPattern = Regex("[A-HJ-NPR-Z0-9]{17}")
-        return vinPattern.findAll(text).map { it.value }.toList()
-    }
-    private fun processBarcode(barcode: Barcode) {
-        if (!isScanning || decodedVinList.size >= MAX_SCAN_COUNT) return
+        val action = FocusMeteringAction.Builder(centerPoint, FocusMeteringAction.FLAG_AF)
+            .setAutoCancelDuration(2, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
 
-        val parsedCode = barcode.displayValue?.trimStart { it == 'I' || it == 'O' }
-        if (parsedCode != null && isValidVin(parsedCode)) {
-            decodedVinList.add(parsedCode)
-            Log.d(TAG, "Barcode SCANNED : $parsedCode")
-            checkMaxVinArraySize()
-        }
+        camera.cameraControl.startFocusAndMetering(action)
     }
 
-    private fun checkMaxVinArraySize() {
-        if (decodedVinList.isNotEmpty() && decodedVinList.size >= MAX_SCAN_COUNT) {
-            findMostCommonString(decodedVinList)?.let { maxValue ->
-                Log.d(TAG, "MAX Scanned VIN : $maxValue")
-                isScanning = false
-                returnResult("VIN", maxValue)
-            }
-        }
-    }
-
-    private class BarcodeAndTextAnalyzer(
-        private val onBarcodeDetected: (Barcode) -> Unit,
-        private val onTextDetected: (String) -> Unit
+    private class EnhancedBarcodeAndTextAnalyzer(
+        private val onVinDetected: (VinScanResult) -> Unit
     ) : ImageAnalysis.Analyzer {
         private val barcodeScanner = BarcodeScanning.getClient()
         private val textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        private var lastProcessTime = 0L
+        private val processedVins = mutableSetOf<String>()
 
         @OptIn(ExperimentalGetImage::class)
         override fun analyze(imageProxy: ImageProxy) {
+            val currentTime = System.currentTimeMillis()
+            if (currentTime - lastProcessTime < PROCESS_INTERVAL_MS) {
+                imageProxy.close()
+                return
+            }
+            lastProcessTime = currentTime
+
             val mediaImage = imageProxy.image
             if (mediaImage != null) {
                 val inputImage = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
@@ -147,41 +140,106 @@ class OldScannerActivity : AppCompatActivity() {
         private fun processBarcodes(inputImage: InputImage, imageProxy: ImageProxy) {
             barcodeScanner.process(inputImage)
                 .addOnSuccessListener { barcodes ->
-                    barcodes.firstOrNull { isValidVin(it.displayValue) }?.let {
-                        onBarcodeDetected(it)
-                        imageProxy.close()
-                        return@addOnSuccessListener // Skip OCR if barcode is detected
+                    var foundValidBarcode = false
+
+                    for (barcode in barcodes) {
+                        val cleanedValue = barcode.displayValue?.let { cleanVinString(it) }
+                        if (cleanedValue != null && isValidVin(cleanedValue)) {
+                            Log.d("Scanner", "Found barcode: $cleanedValue")
+                            onVinDetected(VinScanResult(
+                                cleanedValue,
+                                0.9f,
+                                ScanSource.BARCODE,
+                                System.currentTimeMillis()
+                            ))
+                            foundValidBarcode = true
+                            break
+                        }
                     }
-                    processText(inputImage, imageProxy) // Proceed to OCR if no barcode is found
+
+                    if (!foundValidBarcode) {
+                        // Only try OCR if no valid barcode found
+                        processText(inputImage, imageProxy)
+                    } else {
+                        imageProxy.close()
+                    }
                 }
-                .addOnFailureListener { imageProxy.close() }
+                .addOnFailureListener {
+                    processText(inputImage, imageProxy)
+                }
         }
 
         private fun processText(inputImage: InputImage, imageProxy: ImageProxy) {
             textRecognizer.process(inputImage)
                 .addOnSuccessListener { visionText ->
-                    val potentialVINs = extractPotentialVINs(visionText.text)
-                    potentialVINs.firstOrNull { isValidVin(it) }?.let {
-                        onTextDetected(it)
+                    val text = visionText.text
+                    Log.d("Scanner", "OCR Text: $text")
+
+                    val vinPattern = Regex("[A-HJ-NPR-Z0-9]{17}")
+                    val matches = vinPattern.findAll(text)
+
+                    matches.forEach { match ->
+                        val potentialVin = cleanVinString(match.value)
+                        if (isValidVin(potentialVin)) {
+                            Log.d("Scanner", "Found VIN in OCR: $potentialVin")
+                            onVinDetected(VinScanResult(
+                                potentialVin,
+                                0.8f,
+                                ScanSource.OCR,
+                                System.currentTimeMillis()
+                            ))
+                        }
                     }
                     imageProxy.close()
                 }
-                .addOnFailureListener { imageProxy.close() }
-        }
-        private fun extractPotentialVINs(text: String): List<String> {
-            val vinPattern = Regex("[A-HJ-NPR-Z0-9]{17}")
-            return vinPattern.findAll(text).map { it.value }.toList()
+                .addOnFailureListener {
+                    imageProxy.close()
+                }
         }
 
-
+        private fun cleanVinString(input: String): String {
+            return input
+                .replace('O', '0')
+                .replace('I', '1')
+                .replace('Q', '0')
+                .trim()
+        }
+        companion object {
+            private const val PROCESS_INTERVAL_MS = 200L
+            private const val MIN_BARCODE_WIDTH = 100
+            private const val MIN_BRIGHTNESS = 40f
+        }
     }
 
-    private fun findMostCommonString(strings: ArrayList<String>): String? {
-        return strings.groupingBy { it }
-            .eachCount()
-            .maxByOrNull { it.value }
+    private fun processVinResult(result: VinScanResult) {
+        if (!isScanning || decodedVinList.size >= MAX_SCAN_COUNT) return
+
+        decodedVinList.add(result)
+        Log.d(TAG, "Processed VIN: ${result.value} (${result.source}, confidence: ${result.confidence})")
+        checkMaxVinArraySize()
+    }
+
+    private fun checkMaxVinArraySize() {
+        if (decodedVinList.size >= MAX_SCAN_COUNT) {
+            findMostReliableVin()?.let { maxValue ->
+                Log.d(TAG, "Final VIN selected: $maxValue")
+                isScanning = false
+                returnResult("VIN", maxValue)
+            }
+        }
+    }
+
+    private fun findMostReliableVin(): String? {
+        return decodedVinList
+            .groupBy { it.value }
+            .maxByOrNull { (_, results) ->
+                // Weight by both frequency and confidence
+                results.size * results.map { it.confidence }.average()
+            }
             ?.key
     }
+
+
 
     private fun returnResult(type: String, value: String) {
         val resultIntent = Intent().apply {
@@ -212,9 +270,11 @@ class OldScannerActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "OldScannerActivity"
         private const val CAMERA_PERMISSION_REQUEST_CODE = 0
-        private const val MAX_SCAN_COUNT = 10
+        private const val MAX_SCAN_COUNT = 1
+        private const val MIN_PROCESS_INTERVAL = 200L
         private val VIN_REGEX = "^(?!.*[IOQ])[A-HJ-NPR-Z0-9]{17}$".toRegex()
 
+        // Existing VIN validation logic remains the same
         private fun isValidVin(vin: String?): Boolean {
             if (vin == null || !vin.matches(VIN_REGEX)) return false
 
