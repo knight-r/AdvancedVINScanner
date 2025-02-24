@@ -15,6 +15,7 @@ import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
+import com.example.vinscanner.ScannerActivity.Companion
 import com.example.vinscanner.databinding.ActivityOldScannerBinding
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
@@ -66,6 +67,7 @@ class OldScannerActivity : AppCompatActivity() {
 
         val imageAnalysis = ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
             .build()
             .also {
                 it.setAnalyzer(cameraExecutor, BarcodeAndTextAnalyzer(
@@ -211,7 +213,7 @@ class OldScannerActivity : AppCompatActivity() {
         private const val TAG = "OldScannerActivity"
         private const val CAMERA_PERMISSION_REQUEST_CODE = 0
         private const val MAX_SCAN_COUNT = 10
-        private val VIN_REGEX = "^[A-HJ-NPR-Z0-9]{17}$".toRegex()
+        private val VIN_REGEX = "^(?!.*[IOQ])[A-HJ-NPR-Z0-9]{17}$".toRegex()
 
         private fun isValidVin(vin: String?): Boolean {
             if (vin == null || !vin.matches(VIN_REGEX)) return false
